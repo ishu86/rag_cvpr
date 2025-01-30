@@ -40,4 +40,3 @@ Code for fine-tuning LLaMA-2 model on custom datasets using QLoRA and deploying 
 
 ## GPU Requirements
 - CUDA-compatible GPU recommended
-- Supports bfloat16 training on Ampere+ GPUs
