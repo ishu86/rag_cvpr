@@ -1,5 +1,6 @@
 Open the notebooks from google colab if you have rendering issues by following links:
-
+'finetune_llama2.ipynb' : https://colab.research.google.com/drive/1pQDDgOoBQFpIdwfCA6Tna-LdFvQ2XVBb?usp=sharing
+'merge_llama.ipynb' : https://colab.research.google.com/drive/1Lo_5z5yXsmTh_ymgPcxSZ8qRqC28sSuo?usp=sharing 
 
 # LLaMA-2 Fine-tuning and Deployment
 
