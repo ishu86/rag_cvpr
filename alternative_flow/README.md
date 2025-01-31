@@ -21,6 +21,14 @@ A Retrieval-Augmented Generation (RAG) system for interacting with CVPR research
 ```bash
 git clone https://github.com/<your-username>/arxiv-cvpr-rag.git
 cd arxiv-cvpr-rag
-
+```
 2. Install dependencies:
+```bash
 pip install -r requirements.txt
+```
+3. Set up Ollama
+# Start Ollama service
+ollama serve
+
+# In separate terminal, pull model:
+ollama pull llama2
