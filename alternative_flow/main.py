@@ -1,15 +1,21 @@
 import os
+import re
 import yaml
+import ollama
+import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict
 import arxiv
-import fitz  
+from langchain.docstore.document import Document
+import argparse
+import fitz
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
-from langchain.vectorstores import FAISS
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
-from langchain.llms import Ollama
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama.llms import OllamaLLM
+from langchain_ollama import OllamaEmbeddings
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain.tools import Tool
 from langchain import hub
@@ -21,26 +27,16 @@ from langchain.agents import create_react_agent, AgentExecutor
 
 @dataclass
 class Config:
-    """Configuration class to store system parameters
-    
-    Attributes:
-        data_dir: Directory to store downloaded papers
-        model_dir: Directory for model checkpoints
-        vector_db_path: Path to store FAISS vector database
-        arxiv_query: ArXiv search query string
-        chunk_size: Size of text chunks for processing
-        chunk_overlap: Overlap between consecutive chunks
-        embedding_model: Name of the embedding model to use
-    """
     data_dir: str
     model_dir: str
     vector_db_path: str
-    arxiv_query: str = "cat:cs.CV AND submittedDate:[2023 TO 2024]"  # Default to recent CV papers
+    arxiv_query: str = "cat:cs.CV AND submittedDate:[2023 TO 2024]"
     chunk_size: int = 512
     chunk_overlap: int = 100
     embedding_model: str = "all-MiniLM-L6-v2"
 
-# Template for structured concept explanations
+
+
 EXPLAIN_TEMPLATE = """Explain {concept} using:
 1. Simple analogy: {analogy}
 2. Mathematical formulation: {math}
@@ -48,34 +44,22 @@ EXPLAIN_TEMPLATE = """Explain {concept} using:
 
 Context: {context}"""
 
+
+
+
+
 class ARXIVRAGSystem:
-    """A Retrieval-Augmented Generation system for ArXiv papers
-    
-    This system downloads papers from ArXiv, processes them, creates embeddings,
-    and provides various tools for paper analysis and comparison.
-    """
-    
     def __init__(self, config: Config):
-        """Initialize the RAG system with given configuration
-        
-        Args:
-            config: Configuration object containing system parameters
-        """
         self.config = config
         os.makedirs(config.data_dir, exist_ok=True)
         os.makedirs(config.model_dir, exist_ok=True)
-        # Initialize local LLama2 model with specific parameters
-        self.llm = Ollama(base_url="http://localhost:8083", model="llama2-arxiv-4bit:latest", num_predict=500, temperature=0.5)
+        self.llm = OllamaLLM(base_url="http://localhost:8083", model="llama2:latest", num_predict=500, temperature=0.5)
+        self.embed_model = OllamaLLM(base_url="http://localhost:8083", model="nomic-embed-text:latest")
     
-    def download_papers(self, max_results: int = 10) -> List[Dict]:
-        """Fetch papers from arXiv based on configured query
-        
-        Args:
-            max_results: Maximum number of papers to download
             
-        Returns:
-            List of dictionaries containing paper metadata
-        """
+
+    def download_papers(self, max_results: int = 10) -> List[Dict]:
+        """Fetch papers from arXiv CVPR category"""
         client = arxiv.Client()
         search = arxiv.Search(
             query=self.config.arxiv_query,
@@ -94,226 +78,307 @@ class ARXIVRAGSystem:
             papers.append(paper)
             result.download_pdf(dirpath=self.config.data_dir)
         return papers
+    
+    def is_arxiv_id(self, input_str: str) -> bool:
+        """Check if input matches arXiv ID pattern"""
+        return re.match(r'^\d{4}\.\d{5}(v\d+)?$', input_str) is not None
+
+    def normalize_input(self, paper_input: str) -> dict:
+        """Return filter criteria based on input type"""
+        if self.is_arxiv_id(paper_input):
+            return {"field": "arxiv_id", "value": paper_input}
+        else:
+            return {
+                "field": "title_lower",
+                "value": paper_input.replace("_", " ").strip().lower()
+            }
 
     def process_pdf(self, filename: str) -> str:
-        """Extract and chunk text from PDF documents
-        
-        Args:
-            filename: Name of the PDF file to process
-            
-        Returns:
-            List of text chunks from the PDF
-        """
+        """Extract and chunk text from PDF"""
         doc = fitz.open(os.path.join(self.config.data_dir, filename))
         text = " ".join([page.get_text() for page in doc])
         
-        # Create chunks with overlap for better context preservation
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap
         )
-        return splitter.split_text(text)
+        return splitter.split_text(text) 
+    
+    def clean_paper_title(self, filename: str) -> str:
+        """Clean arxiv paper filename to get readable title"""
+        # Remove arxiv ID and version number
+        import re
+        parts = re.split(r'\d+v\d+\.', filename)
+        clean_title = parts[-1]
+        
+        # Remove .pdf extension
+        clean_title = clean_title.rsplit('.', 1)[0]
+        
+        # Replace underscores with spaces 
+        clean_title = clean_title.replace('_', ' ')
+        
+        # Clean extra whitespace
+        clean_title = ' '.join(clean_title.split())
+        
+        return clean_title
+        
+    def extract_arxiv_id(self, filename: str) -> str:
+        """Extract arXiv ID from filename using regex"""
+        pattern = r"(\d{4}\.\d{5})|arXiv:(\d{4}\.\d{5})"
+        match = re.search(pattern, filename)
+        return match.group(1) if match and match.group(1) else match.group(2) if match else None
+
+
 
     def create_vector_store(self):
-        """Create FAISS vector database from processed papers
+        embedder = OllamaEmbeddings(model="nomic-embed-text:latest", base_url="http://localhost:8083")
         
-        Processes all PDFs in the data directory and creates embeddings
-        using the configured embedding model
-        """
-        embedder = HuggingFaceEmbeddings(
-            model_name=self.config.embedding_model,
-            model_kwargs={'device': 'cpu'}
-        )
-        
-        texts = []
+        documents = []
         for filename in os.listdir(self.config.data_dir):
             if filename.endswith(".pdf"):
+                clean_title = self.clean_paper_title(filename)
+                arxiv_id = self.extract_arxiv_id(filename)
+                
                 chunks = self.process_pdf(filename)
-                texts.extend(chunks)
-    
-        db = FAISS.from_texts(texts, embedder)
+                documents.extend([
+                    Document(
+                        page_content=chunk,
+                        metadata={
+                            "source": filename,
+                            "title": clean_title,
+                            "title_lower": clean_title.lower(),  # For case-insensitive search
+                            "arxiv_id": arxiv_id   # Fallback if no match
+                        }
+                    ) for chunk in chunks
+                ])
+        
+        db = FAISS.from_documents(documents, embedder)
         db.save_local(self.config.vector_db_path)
         return db
+  
+
 
     def load_qa_chain(self):
-        """Load retrieval QA chain with local LLM
-        
-        Creates a QA chain that combines the vector store for retrieval
-        and the local LLama2 model for generation
-        """
-        embedder = HuggingFaceEmbeddings(
-            model_name=self.config.embedding_model,
-            model_kwargs={'device': 'cpu'}
-        )
+        """Load retrieval QA chain with local LLM"""
+        embedder = OllamaEmbeddings(
+        model="nomic-embed-text:latest",  # Model name in Ollama
+        base_url="http://localhost:8083"  # Ollama server URL
+    )
         
         db = FAISS.load_local(
             self.config.vector_db_path,
             embedder,
             allow_dangerous_deserialization=True
         )
+      
+
         
         llm = Ollama(base_url="http://localhost:8083", model="llama2-arxiv-4bit:latest", num_predict=500, temperature=0.5)
 
+
+        
         return RetrievalQA.from_chain_type(
             llm=llm,
-            retriever=db.as_retriever(search_kwargs={"k": 3}),
+            retriever=db.as_retriever(search_kwargs={"k": 5}),
             chain_type="stuff"
         )
     
+    
+    def get_context(self, query: str) -> str:
+        """Retrieve relevant context for a query"""
+        retriever = self.load_qa_chain().retriever
+        docs = retriever.invoke(query)
+        return "\n".join([d.page_content for d in docs][:5])
+    
     def get_tools(self):
-        """Create custom tools for the agent
-        
-        Returns:
-            List of Tool objects for different paper analysis tasks
-        """
+        """Create custom tools for agent"""
         base_retriever = self.load_qa_chain().retriever
-
-        def safe_retrieve(query: str, filter: dict = None, k: int = 3):
-            """Safe wrapper for retriever calls to handle edge cases"""
-            if isinstance(query, dict):  # Handle accidental dict inputs
-                query = query.get("query", "")
-            return base_retriever.invoke(query, filter=filter, k=k)
-
-        @tool
-        def paper_summarizer(paper_title: str) -> str:
-            """Summarize key contributions of a paper
-            
-            Args:
-                paper_title: Title of the paper to summarize
-            """
-            docs = safe_retrieve(
-                f"Summarize this paper: {paper_title}",
-                filter={"title": paper_title},
-                k=1
-            )
-            content = docs[0].page_content[:2000]  # Truncate for LLM context
-            return self.llm(f"Summarize in 3 bullet points: {content}")
         
         @tool
-        def paper_comparator(paper_titles: str) -> str:
-            """Compare methodologies between papers
+        def paper_summarizer(paper_input: str) -> str:
+            """Summarize a paper using title or arXiv ID. Input format: 'Title' or 'arXiv ID'"""
+            try:
+                criteria = self.normalize_input(paper_input)
+                docs = base_retriever.invoke(
+                    f"Summary of {paper_input}",
+                    filter={criteria["field"]: criteria["value"]},
+                    k=2
+                )
+                
+                if not docs:
+                    return f"Paper '{paper_input}' not found. Try arXiv ID (e.g., 2401.00608v5) or exact title"
+                    
+                # Get display title from metadata
+                display_title = docs[0].metadata.get("title", paper_input)
+                content = "\n".join([d.page_content[:1000] for d in docs])
+                return self.llm(f"Summarize in 3 bullet points: {content}\nPaper Title: {display_title}")
             
-            Args:
-                paper_titles: Comma-separated list of paper titles to compare
-            """
-            paper_list = [t.strip() for t in paper_titles.split(",")]
+            except Exception as e:
+                return f"Summarization error: {str(e)}"
+                
+        
+        @tool
+        def paper_comparator(paper_inputs: str) -> str:
+            """Compare 2 papers. Input format: 'Title/ID1, Title/ID2'"""
+            try:
+                papers = [p.strip() for p in paper_inputs.split(",", 1)]
+                if len(papers) != 2:
+                    return "Error: Format must be 'Title/ID1, Title/ID2'"
+                
+                contexts = []
+                for paper in papers:
+                    criteria = self.normalize_input(paper)
+                    docs = base_retriever.invoke(
+                        f"Methodology of {paper}",
+                        filter={criteria["field"]: criteria["value"]},
+                        k=2
+                    )
+                    if docs:
+                        title = docs[0].metadata.get("title", paper)
+                        contexts.append(f"=== {title} ===\n{docs[0].page_content}")
+                
+                if len(contexts) != 2:
+                    return "Could not find both papers"
+                    
+                return self.llm(f"Compare these methodologies:\n{'-'*40}\n" + "\n\n".join(contexts))
             
-            contexts = []
-            for title in paper_list:
-                docs = base_retriever.invoke({
-                    "query": f"Extract methodology section for {title}",
-                    "filter": {"title": title}
-                })
-                if docs:
-                    contexts.append(f"Paper: {title}\nContent: {docs[0].page_content}")
-            
-            if not contexts:
-                return "No relevant papers found"
-            
-            return self.llm(f"Compare methodologies:\n{'-'*50}\n" + "\n\n".join(contexts))
+            except Exception as e:
+                return f"Comparison error: {str(e)}"
         
         @tool
         def methodology_explainer(concept: str, depth: str = "beginner") -> str:
-            """Explain complex CV concepts at specified depth
+            """Explain concepts with paper citations. Input format: 'concept, depth'"""
+            try:
+                docs = base_retriever.invoke(
+                    f"Technical explanations of {concept}",
+                    k=4
+                )
+                
+                # Build citation map
+                sources = {}
+                for d in docs:
+                    title = d.metadata.get("title", "Unknown Paper")
+                    sources[title] = d.metadata.get("arxiv_id", "")
+                
+                # Generate explanation
+                explanation = self.llm(
+                    f"Explain {concept} at {depth} level using:\n"
+                    f"{' '.join([d.page_content for d in docs])}\n\n"
+                    "Include citations in format [PaperTitle]"
+                )
+                
+                # Add reference section
+                refs = "\n".join([f"- [{title}](https://arxiv.org/abs/{arxiv_id})" 
+                                for title, arxiv_id in sources.items()])
+                return f"{explanation}\n\nReferences:\n{refs}"
             
-            Args:
-                concept: The concept to explain
-                depth: Desired explanation depth (beginner/intermediate/advanced)
-            """
-            docs = base_retriever.invoke({
-                "query": f"Find technical explanations of {concept}",
-                "k": 3
-            })
-            contexts = [d.page_content for d in docs]
-            
-            prompt = EXPLAIN_TEMPLATE.format(
-                concept=concept,
-                context="\n---\n".join(contexts)
-            )
-            
-            return self.llm(
-                f"Follow this format strictly:\n{prompt}\n"
-                f"Adapt explanation for {depth} level:"
-            )
+            except Exception as e:
+                return f"Explanation error: {str(e)}"
 
-        # Return list of all available tools
-        return [
-            paper_summarizer,
-            paper_comparator,
-            methodology_explainer,
+        tools = [
             Tool(
-                name="General QA",
-                func=self.load_qa_chain().run,
-                description="Answer general questions about computer vision research"
+                name="paper_summarizer",
+                func=paper_summarizer,
+                description="Summarize a paper using title or arXiv ID"
+            ), Tool(
+                name="paper_comparator",
+                func=paper_comparator,
+                description="Compare 2 papers. Input format: 'Title/ID1, Title/ID2'"
+            ), Tool(
+                name="methodology_explainer",
+                func=methodology_explainer,
+                description="Explain concepts with paper citations. Input format: 'concept, depth'"
             )
         ]
+        
+        return tools    
 
+
+ 
     def get_agent(self):
-        """Create an agent with the defined tools
-        
-        Returns:
-            AgentExecutor instance configured with tools and prompt template
-        """
-        # Load and customize the ReAct prompt template
-        prompt = hub.pull("hwchase17/react")
-        prompt.template = """Answer questions using these tools: {tool_names}
+        SIMPLE_RAG_PROMPT = """You are a CVPR research assistant. Follow these steps:
 
-    Strictly follow this format:
-    Thought: Reason about the task
-    Action: tool_name
-    Action Input: "input"
-    Observation: tool_result
-    ... (repeat if needed)
-    Thought: Final answer
-    Final Answer: Concise response
+    1. Analyze the question and choose the correct tool:
+    - Summarize a paper? → paper_summarizer
+    - Compare papers? → paper_comparator
+    - Explain a concept? → methodology_explainer
 
-    Begin!
+    2. Use the tool with EXACT parameters from the context.
 
+    3. Format your response strictly as:
+
+    Thought: [Your reasoning]
+    Action: [Tool name]
+    Action Input: "[Tool input]"
+    Observation: [Tool output]
+    ... (up to strictly one iteration only)
+    Final Answer: [Concise response citing sources]
+
+    **Available Tools:**
+    {tools}
+    {tool_descriptions}
+
+    **Context:** {context}
+
+    **Begin!**
     Question: {input}
-    Thought:{agent_scratchpad}"""
+    {agent_scratchpad}"""
         
-        return AgentExecutor(
-            agent=create_react_agent(self.llm, self.get_tools(), prompt),
-            tools=self.get_tools(),
-            verbose=True,
-            handle_parsing_errors=True,
-            max_iterations=3,
-            early_stopping_method="generate"
+        tools = self.get_tools()
+        tool_descriptions = "\n".join([f"- {tool.name}: {tool.description}" for tool in tools])
+
+        prompt = ChatPromptTemplate.from_template(SIMPLE_RAG_PROMPT).partial(tools=tools,tool_names=tools,
+            tool_descriptions=tool_descriptions
         )
 
-def load_config(config_path: str) -> Config:
-    """Load configuration from YAML file
-    
-    Args:
-        config_path: Path to the configuration YAML file
+        return AgentExecutor(
+            agent=create_react_agent(self.llm, tools, prompt),
+            tools=tools,
+            verbose=True,
+            max_iterations=5,
+            handle_parsing_errors=lambda _: "Please rephrase your query",
+            early_stopping_method="generate"
+        )
         
-    Returns:
-        Config object with loaded parameters
-    """
+
+
+
+
+
+
+    
+    
+def load_config(config_path: str) -> Config:
     with open(config_path) as f:
         config_data = yaml.safe_load(f)
     return Config(**config_data)
 
-if __name__ == "__main__":
-    # Example usage of the RAG system
+import argparse  
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--setup", action="store_true", help="Initialize the system and create vector store")
+    args = parser.parse_args()
+
     config = load_config("config.yaml")
     system = ARXIVRAGSystem(config)
-    
-    # Initialize agent
-    agent = system.get_agent()
 
-    # Example query
-    query = "summarize A_Generalist_FaceX_via_Learning_Unified_Facial_Representation"
-    print(f"\nQuery: {query}")
-    print("Answer:", agent.invoke({"input": query}))
+    if args.setup:
+        print("Downloading papers...")
+        system.download_papers(max_results=10)  # Adjust number of papers as needed
+        
+        print("Creating vector store...")
+        system.create_vector_store()
+        print("Setup complete! Vector store created at:", config.vector_db_path)
+    else:
+        # Normal operation
+        agent = system.get_agent()
+        query = "What are large language models? Answer up to the point"
+        context = system.get_context(query)
+        print(f"\nContext:\n{context}")
+        print(f"\nQuery: {query}")
+        print("Answer:", agent.invoke({"input": query, "context": context})['output'])
 
-    # Additional example queries (commented out)
-    # queries = [
-    #     "Compare the methodologies in 'Attention Is All You Need' and 'ResNet' papers",
-    #     "Explain transformer architectures to a beginner",
-    #     "Summarize the key contributions of 'Mask R-CNN'"
-    # ]
-    
-    # for query in queries:
-    #     print(f"\nQuery: {query}")
-    #     print("Answer:", agent.invoke({"input": query})["output"])
+
+if __name__ == "__main__":
+    main()
