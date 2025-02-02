@@ -1,4 +1,3 @@
-# streamlit_app.py
 import streamlit as st
 from main import ARXIVRAGSystem, load_config
 from dataclasses import asdict
