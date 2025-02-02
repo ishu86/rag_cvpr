@@ -58,41 +58,6 @@ question = st.text_area(
 # Response container
 response_container = st.container()
 
-# Handle question submission
-# if st.button("Analyze Papers", type="primary") or "current_question" in st.session_state:
-#     if not question:
-#         st.warning("Please enter a question")
-#         st.stop()
-    
-#     with st.spinner("Analyzing papers..."):
-#         try:
-#             agent = system.get_agent()
-#             context = system.get_context(question)
-#             result = agent.invoke({"input": question, "context": context})
-            
-#             with response_container:
-#                 st.markdown("### Analysis Results")
-                
-#                 if "output" in result:
-#                     st.markdown("#### Answer")
-#                     st.markdown(result["output"])
-                
-#                 if "intermediate_steps" in result:
-#                     st.markdown("#### Research Process")
-#                     for step in result["intermediate_steps"]:
-#                         if isinstance(step, tuple) and len(step) == 2:
-#                             action, observation = step
-#                             with st.expander(f"{action.tool}: {action.tool_input}"):
-#                                 st.markdown(f"**Observation**:\n{observation}")
-                
-#                 st.markdown("---")
-#                 st.markdown("**Retrieved Context**")
-#                 st.info(context[:2000])  # Show first 2000 chars of context
-                
-#         except Exception as e:
-#             st.error(f"Error processing request: {str(e)}")
-#             st.error("Please ensure you've initialized the system in the sidebar")
-# In streamlit_app.py
 if st.button("Analyze Papers", type="primary") or "current_question" in st.session_state:
     if not question:
         st.warning("Please enter a question")
