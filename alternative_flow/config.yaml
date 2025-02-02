@@ -4,4 +4,5 @@ vector_db_path: "./vector_store/cvpr_db"
 arxiv_query: "cat:cs.CV AND submittedDate:[2023 TO 2024]"
 chunk_size: 512
 chunk_overlap: 100
-embedding_model: "all-MiniLM-L6-v2"
+embedding_model: "nomic-embed-text:latest"
+ollama_base_url: "http://localhost:8083"  # Ollama server URL
