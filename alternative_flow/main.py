@@ -9,6 +9,7 @@ import arxiv
 from langchain.docstore.document import Document
 import argparse
 import fitz
+from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -24,6 +25,7 @@ from langchain.agents import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain import hub
 from langchain.agents import create_react_agent, AgentExecutor
+from monitoring import monitor_resources
 
 @dataclass
 class Config:
@@ -92,7 +94,7 @@ class ARXIVRAGSystem:
                 "field": "title_lower",
                 "value": paper_input.replace("_", " ").strip().lower()
             }
-
+    @monitor_resources
     def process_pdf(self, filename: str) -> str:
         """Extract and chunk text from PDF"""
         doc = fitz.open(os.path.join(self.config.data_dir, filename))
@@ -129,7 +131,7 @@ class ARXIVRAGSystem:
         return match.group(1) if match and match.group(1) else match.group(2) if match else None
 
 
-
+    @monitor_resources
     def create_vector_store(self):
         embedder = OllamaEmbeddings(model="nomic-embed-text:latest", base_url="http://localhost:8083")
         
@@ -157,7 +159,7 @@ class ARXIVRAGSystem:
         return db
   
 
-
+    @monitor_resources
     def load_qa_chain(self):
         """Load retrieval QA chain with local LLM"""
         embedder = OllamaEmbeddings(
@@ -295,57 +297,58 @@ class ARXIVRAGSystem:
 
 
  
+    @monitor_resources
     def get_agent(self):
-        SIMPLE_RAG_PROMPT = """You are a CVPR research assistant. Follow these steps:
-
-    1. Analyze the question and choose the correct tool:
-    - Summarize a paper? → paper_summarizer
-    - Compare papers? → paper_comparator
-    - Explain a concept? → methodology_explainer
-
-    2. Use the tool with EXACT parameters from the context.
-
-    3. Format your response strictly as:
-
-    Thought: [Your reasoning]
-    Action: [Tool name]
-    Action Input: "[Tool input]"
+        PROMPT_TEMPLATE = """Follow STRICTLY:
+    1. If asked about a SINGLE paper → paper_summarizer
+    2. If comparing papers → paper_comparator
+    3. For concept explanations → methodology_explainer
+    
+    FORMAT:
+    Thought: [Identify tool based on question type]
+    Action: {tool_names}
+    Action Input: "[EXACT title/ID from context]"
     Observation: [Tool output]
-    ... (up to strictly one iteration only)
-    Final Answer: [Concise response citing sources]
-
-    **Available Tools:**
-    {tools}
-    {tool_descriptions}
-
-    **Context:** {context}
-
-    **Begin!**
+    Final Answer: [Concise response with citations]
+    
+    Context: {context}
     Question: {input}
     {agent_scratchpad}"""
-        
+    
         tools = self.get_tools()
-        tool_descriptions = "\n".join([f"- {tool.name}: {tool.description}" for tool in tools])
-
-        prompt = ChatPromptTemplate.from_template(SIMPLE_RAG_PROMPT).partial(tools=tools,tool_names=tools,
+        tool_names = ", ".join([t.name for t in tools])
+        tool_descriptions = "\n".join([f"- {t.name}: {t.description}" for t in tools])
+    
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE).partial(tools=tools,
+            tool_names=tool_names,
             tool_descriptions=tool_descriptions
         )
-
+    
         return AgentExecutor(
             agent=create_react_agent(self.llm, tools, prompt),
             tools=tools,
             verbose=True,
-            max_iterations=5,
-            handle_parsing_errors=lambda _: "Please rephrase your query",
-            early_stopping_method="generate"
+            handle_parsing_errors=lambda _: "Format error - try rephrasing",
+            max_iterations=2,
+            return_intermediate_steps=True,
+            output_parser=UniversalOutputParser(),
+            validate_tools=True 
         )
         
-
-
-
-
-
-
+class UniversalOutputParser(ReActSingleInputOutputParser):
+    def parse(self, text: str):
+        try:
+            # First try strict format parsing
+            return super().parse(text)
+        except Exception:
+            # Fallback 1: Extract content between Answer: and Human:
+            answer_section = re.search(r"Answer:(.*?)(Human:|$)", text, re.DOTALL)
+            if answer_section:
+                return {"output": answer_section.group(1).strip()}
+            
+            # Fallback 2: Capture everything after first paragraph
+            full_answer = re.sub(r"^.*?(?=\bAnswer:)", "", text, flags=re.DOTALL)
+            return {"output": full_answer.strip() or text[:1000]}
     
     
 def load_config(config_path: str) -> Config:
