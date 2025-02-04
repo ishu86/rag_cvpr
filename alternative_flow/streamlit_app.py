@@ -1,3 +1,4 @@
+# streamlit_app.py
 import streamlit as st
 from main import ARXIVRAGSystem, load_config
 from dataclasses import asdict
@@ -33,7 +34,7 @@ with st.sidebar:
     st.markdown("**Example Questions:**")
     example_questions = [
         "Summarize A Generalist FaceX via Learning Unified Facial Representation",
-        "Compare transformer architectures and CNN approaches",
+        "Explain methodology of paper: Masked Modeling for Self supervised Representation Learning on Vision and Beyond",
         "Explain contrastive learning to a beginner",
         "What's the latest in 3D object detection?",
         "Compare diffusion models and GANs for image generation"
@@ -57,6 +58,7 @@ question = st.text_area(
 # Response container
 response_container = st.container()
 
+
 if st.button("Analyze Papers", type="primary") or "current_question" in st.session_state:
     if not question:
         st.warning("Please enter a question")
@@ -65,35 +67,38 @@ if st.button("Analyze Papers", type="primary") or "current_question" in st.sessi
     with st.spinner("Analyzing papers..."):
         try:
             agent = system.get_agent()
-            context = system.get_context(question)
-            result = agent.invoke({"input": question, "context": context})
+            context = system.get_context(question)  # Add this line
+            result = agent.invoke({
+            "input": question,
+            "context": context })
             
-            with response_container:
-                st.markdown("### Analysis Results")
-                
-                # Handle both parsed and unparsed outputs
-                if "output" in result:
-                    st.markdown("#### Answer")
-                    st.markdown(result["output"])
-                elif isinstance(result, str):  # Fallback for unparsed output
-                    st.markdown("#### Answer")
-                    st.markdown(result)
-                
-                if "intermediate_steps" in result:
-                    st.markdown("#### Research Process")
-                    for step in result["intermediate_steps"]:
-                        if isinstance(step, tuple) and len(step) == 2:
-                            action, observation = step
-                            with st.expander(f"{action.tool}: {action.tool_input}"):
-                                st.markdown(f"**Observation**:\n{observation}")
-                
-                st.markdown("---")
-                st.markdown("**Retrieved Context**")
-                st.info(context[:2000])  # Show first 2000 chars of context
-                
+            # Handle parsed output
+            if isinstance(result, dict):
+                output = result.get("output", "No output generated")
+                steps = result.get("intermediate_steps", [])
+            else:
+                output = str(result)
+                steps = []
+
+            st.markdown("### Answer")
+            st.markdown(output)
+
+            if steps:
+                st.markdown("### Process Details")
+                for step in steps:
+                    if isinstance(step, tuple) and len(step) == 2:
+                        action, obs = step
+                        with st.expander(f"{action.tool}: {action.tool_input}"):
+                            st.markdown(f"**Observation**: {obs}")
+                        
         except Exception as e:
-            st.error(f"Error processing request: {str(e)}")
-            st.error("Please ensure you've initialized the system in the sidebar")
+            st.error(f"Error: {str(e)}")
+            if "intermediate_steps" in locals():
+                st.markdown("**Debug Info**")
+                st.code(str(result["intermediate_steps"]))
+        
+
+
 
 # Footer
 st.markdown("---")
